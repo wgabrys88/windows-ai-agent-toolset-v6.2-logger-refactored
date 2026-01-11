@@ -2,947 +2,539 @@
 
 ## SYSTEM OVERVIEW
 
-This is a Windows desktop automation system that uses a vision-language model (VLM) to autonomously control GUI applications. The agent observes the screen via screenshots, receives visual understanding from an LLM API (LM Studio), and executes actions (clicks, typing, key presses, scrolling) to complete user-defined tasks.
+Autonomous Windows Desktop AI Agent with Vision and GUI Control. The system enables a multimodal LLM (Qwen3-VL) to observe screen state via screenshots and execute desktop automation tasks through tool-based function calling. Operates as a perceive-think-act loop with normalized coordinate system for cross-resolution compatibility.
 
-**Architecture Pattern**: Agentic loop with vision-language model feedback
-**Platform**: Windows (uses Win32 API via ctypes)
-**LLM Backend**: LM Studio local server (OpenAI-compatible API)
-**Coordinate System**: Normalized 0-1000 scale (device-independent)
-**Logging Strategy**: Direct HTTP request/response capture (no external log parsing)
-
----
-
-## FILE STRUCTURE AND RESPONSIBILITIES
-
-### main.py
-**Role**: Entry point and orchestration
-
-**Responsibilities**:
-- Command-line argument parsing (scenario selection)
-- Environment variable configuration loading
-- DPI awareness initialization
-- HTTP logger initialization
-- Agent execution lifecycle management
-- Exception handling and logging status reporting
-
-**Key Functions**:
-- `main()`: Entry point, loads scenario and configuration, initializes logging, invokes agent
-
-**External Dependencies**:
-- scenarios (SCENARIOS list, SYSTEM_PROMPT, TOOLS_SCHEMA)
-- agent (run_agent)
-- utils (environment getters, init_http_logger)
-- winapi (init_dpi)
-
-**Configuration via Environment Variables**:
-- LMSTUDIO_ENDPOINT (default: http://localhost:1234/v1/chat/completions)
-- LMSTUDIO_MODEL (default: qwen3-vl-4b-instruct)
-- LMSTUDIO_TIMEOUT (default: 240s)
-- LMSTUDIO_TEMPERATURE (default: 0.4)
-- LMSTUDIO_MAX_TOKENS (default: 2048)
-- AGENT_IMAGE_W/H (default: 1536x864)
-- AGENT_DUMP_DIR (default: dumps)
-- AGENT_KEEP_LAST_SCREENSHOTS (default: 2)
-- AGENT_KEEP_LAST_THINKS (default: 2)
-- AGENT_MAX_STEPS (default: 200)
-- AGENT_STEP_DELAY (default: 0.4s)
-
-**Execution Flow**:
-1. Parse scenario number from command-line
-2. Initialize DPI awareness
-3. Load scenario and configuration
-4. Create timestamped log file
-5. Initialize HTTP logger
-6. Execute agent
-7. Report completion or error status with log file location
-
-**Simplified Design** (compared to previous version):
-- No signal handling (SIGINT/SIGTERM)
-- No log export coordination
-- No LM Studio log path detection
-- No cleanup functions
-- Exception handling prints log location and re-raises
-
----
-
-### agent.py
-**Role**: Core agent loop and LLM interaction
-
-**Responsibilities**:
-- Maintains conversation message history
-- Sends requests to LLM API with tool schema
-- Handles tool call responses from LLM
-- Enforces single tool call per step (prevents tool spam)
-- Prunes old screenshots and think tags from message history
-- Implements step delay and max step limits
-
-**Key Functions**:
-- `run_agent(system_prompt, task_prompt, tools_schema, cfg)`: Main agent loop, returns final output string
-
-**Agent Loop Flow**:
-1. Initialize messages with system prompt and task prompt
-2. Capture initial screenshot via observe_screen tool
-3. Loop (up to max_steps):
-   - Send messages + tools schema to LLM endpoint via utils.post_json()
-   - Receive assistant message (may contain tool_calls)
-   - If no tool_calls: return stripped content (task complete)
-   - If multiple tool_calls: reject extras, keep only first
-   - Execute tool via scenarios.execute_tool()
-   - Append tool response and optional user message (screenshot)
-   - Prune old screenshots and think tags
-   - Sleep step_delay
-4. Return last content if max_steps exceeded
-
-**Message History Management**:
-- Prunes old screenshots to keep last N (memory optimization)
-- Prunes old <think> tags to keep last N (context window optimization)
-
-**HTTP Logging Integration**:
-- All HTTP requests/responses automatically logged by utils.post_json()
-- No explicit logging calls in agent.py
-
----
-
-### scenarios.py
-**Role**: Tool definitions, execution logic, and task scenarios
-
-**Responsibilities**:
-- Define tool JSON schemas for LLM function calling
-- Execute tool actions via winapi
-- Manage screen dimension state (for coordinate conversion)
-- Provide system prompt and task scenarios
-- Handle screenshot capture and base64 encoding
-- Validate and parse tool arguments
-
-**Tool Definitions** (TOOLS_SCHEMA):
-1. **observe_screen**: Captures screenshot, returns image to LLM
-2. **click_element**: Clicks UI element at normalized coordinates
-3. **type_text**: Types ASCII text into focused field
-4. **press_key**: Presses keyboard key or combination
-5. **scroll_at_position**: Scrolls down at specified position
-
-**Key Functions**:
-- `execute_tool(tool_name, arg_str, call_id, dump_cfg)`: Dispatches tool execution, returns (tool_message, optional_user_message)
-
-**Tool Execution Details**:
-
-**observe_screen**:
-- Captures PNG screenshot via winapi.capture_screenshot_png()
-- Saves to disk (dumps directory)
-- Updates global screen dimensions
-- Returns tool message + user message with base64 image
-
-**click_element**:
-- Parses label and box (supports [x,y], [x1,y1,x2,y2], [[x1,y1],[x2,y2]])
-- Converts normalized coords to pixels
-- Moves mouse via winapi.move_mouse_to_pixel()
-- Clicks via winapi.click_mouse()
-- Returns success message
-
-**type_text**:
-- Validates text is ASCII (strips non-ASCII)
-- Types via winapi.type_text()
-- Returns success message
-
-**press_key**:
-- Validates key string
-- Presses via winapi.press_key()
-- Returns success or error message
-
-**scroll_at_position**:
-- Parses optional box (defaults to center 500,500)
-- Moves mouse to position
-- Scrolls via winapi.scroll_down()
-- Returns success message
-
-**Global State**:
-- `_screen_dimensions`: {"width": int, "height": int} - updated by observe_screen
-
-**System Prompt** (SYSTEM_PROMPT):
-- Defines agent identity and capabilities
-- Explains normalized coordinate system (0-1000)
-- Specifies operating protocol (observe -> think -> act -> verify)
-- Sets rules (normalized coords, point clicks preferred, click before type, one action per step)
-
-**Scenarios** (SCENARIOS list):
-- Currently contains one scenario: GitHub project investigation via Grok AI with continuous learning loop
-
----
-
-### winapi.py
-**Role**: Windows API bindings and low-level OS interaction
-
-**Responsibilities**:
-- DPI awareness configuration
-- Screen capture (with cursor overlay)
-- Mouse control (movement, clicking, scrolling)
-- Keyboard input (text typing, key presses)
-- PNG encoding (custom implementation to avoid external dependencies)
-
-**API Libraries Used**:
-- user32.dll: UI interaction (mouse, keyboard, cursor, DPI)
-- gdi32.dll: Graphics (screenshot, bitmap operations)
-
-**Key Functions**:
-
-**DPI Management**:
-- `init_dpi()`: Sets process DPI awareness to per-monitor V2
-- `get_screen_size()`: Returns physical screen dimensions
-
-**Coordinate Conversion**:
-- `norm_to_screen_px(xn, yn, screen_w, screen_h)`: Converts 0-1000 normalized coords to pixel coords
-
-**Screen Capture**:
-- `capture_screenshot_png(target_w, target_h)`: Captures screen, scales to target size, overlays cursor, returns PNG bytes
-  - Uses CreateDIBSection for bitmap
-  - StretchBlt for scaling (HALFTONE mode for quality)
-  - Custom PNG encoding (no PIL dependency)
-  - Returns (png_bytes, screen_w, screen_h)
-
-**PNG Encoding**:
-- `_rgb_to_png_bytes(rgb, width, height)`: Converts RGB bytes to PNG format
-- `_png_pack(tag, data)`: Creates PNG chunks with CRC32
-
-**Cursor Handling**:
-- `_draw_cursor_on_dc(hdc_mem, screen_w, screen_h, dst_w, dst_h)`: Draws cursor on scaled screenshot
-
-**Mouse Control**:
-- `move_mouse_to_pixel(x, y)`: Moves cursor to pixel coordinates
-- `click_mouse()`: Left click at current position
-- `scroll_down(amount)`: Scroll wheel down (default 120 units)
-
-**Keyboard Control**:
-- `type_text(text)`: Types Unicode text character-by-character
-- `press_key(key)`: Presses key combinations (supports modifiers: ctrl, alt, shift, win)
-- Supported keys: enter, tab, escape, windows, ctrl, alt, shift, f4, c, v, t, w, f, l
-
-**Input Structures** (ctypes):
-- INPUT, MOUSEINPUT, KEYBDINPUT, HARDWAREINPUT
-- CURSORINFO, ICONINFO, BITMAPINFO, BITMAPINFOHEADER
-
-**Constants**:
-- Mouse events: MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL
-- Keyboard events: KEYEVENTF_KEYUP, KEYEVENTF_UNICODE
-- GDI: SRCCOPY, HALFTONE, BI_RGB, DIB_RGB_COLORS
-
----
-
-### utils.py
-**Role**: Utility functions for JSON handling, message processing, HTTP, and logging
-
-**Responsibilities**:
-- JSON payload construction (success/error responses)
-- Tool argument parsing
-- Bounding box parsing (multiple formats)
-- Message history pruning (screenshots, think tags)
-- HTTP POST requests with automatic logging
-- Environment variable helpers
-- Base64 image data truncation for readable logs
-
-**Key Function Groups**:
-
-**HTTP Logging**:
-- `init_http_logger(log_file)`: Initializes Python logging module with file handler
-  - Creates logger named 'http_exchange'
-  - Sets formatter to plain text (no timestamps, just messages)
-  - Opens file in write mode with UTF-8 encoding
-  - Disables propagation to root logger
-- `_http_logger`: Global logger instance (module-level variable)
-
-**JSON Payload Helpers**:
-- `ok_payload(extra)`: Constructs success response {"ok": True, ...}
-- `err_payload(error_type, message)`: Constructs error response {"ok": False, "error": {...}}
-- `parse_args(arg_str)`: Parses tool arguments (handles dict, JSON string, None)
-
-**Box Parsing**:
-- `parse_box(box)`: Parses click targets in 3 formats:
-  - Point: [x, y]
-  - Flat bbox: [x1, y1, x2, y2]
-  - Legacy bbox: [[x1, y1], [x2, y2]]
-  - Clamps to 0-1000 range
-  - Normalizes (x1 < x2, y1 < y2)
-- `box_center(x1, y1, x2, y2)`: Computes center point
-
-**Message Hygiene**:
-- `strip_think(text)`: Removes <think>...</think> tags from text
-- `prune_old_screenshots(messages, keep_last)`: Removes old screenshot image_url data from user messages
-- `prune_old_thinks(messages, keep_last)`: Removes old <think> tags from assistant messages
-
-**Image Data Truncation**:
-- `summarize_data_image_url(url)`: Replaces base64 image payload with hash summary
-  - Preserves data:image/png;base64, header
-  - Replaces payload with [b64 sha=XXXXXXXXXXXX len=NNNNN]
-  - SHA256 hash truncated to 12 characters
-- `truncate_base64_images(obj)`: Recursively truncates base64 images in JSON structures
-  - Processes dicts and lists
-  - Targets "url" keys with data:image/ values
-  - Creates deep copy via JSON round-trip
-
-**HTTP with Automatic Logging**:
-- `post_json(payload, endpoint, timeout)`: Sends JSON POST request, returns parsed response
-  - **Logs request before sending**:
-    - Deep copies payload
-    - Truncates base64 images for readability
-    - Logs pretty-printed JSON with separator line
-  - Sends request via urllib.request
-  - **Logs response after receiving**:
-    - Logs pretty-printed JSON with separator line
-  - Returns response dict
-  - All logging is synchronous (file auto-flushed by Python logging module)
-
-**Environment Variables**:
-- `get_env_str(name, default)`: Gets string from env
-- `get_env_int(name, default)`: Gets int from env
-- `get_env_float(name, default)`: Gets float from env
-
-**Removed Functions** (compared to previous version):
-- extract_json_from_position()
-- clean_log_file()
-- parse_log_ts()
-- export_and_clean_current_run()
-- lmstudio_log_candidates()
-- month_str()
-
----
-
-## COMPONENT INTERACTION FLOW
+## ARCHITECTURE
 
 ```
 main.py
   |
-  +--[init]-> winapi.init_dpi()
-  |
-  +--[init]-> utils.init_http_logger(log_file)
-  |           |
-  |           +--[creates]-> agent_run_YYYYMMDD_HHMMSS.log
-  |
-  +--[load]-> scenarios.SCENARIOS, scenarios.SYSTEM_PROMPT, scenarios.TOOLS_SCHEMA
-  |
-  +--[run]--> agent.run_agent(system_prompt, task_prompt, tools_schema, cfg)
-              |
-              +--[loop]--> utils.post_json() -> LM Studio API
-              |            |
-              |            +--[log]-----> agent_run_*.log (REQUEST)
-              |            |
-              |            +--[send]-----> HTTP POST
-              |            |
-              |            +--[receive]---> HTTP response
-              |            |
-              |            +--[log]-----> agent_run_*.log (RESPONSE)
-              |            |
-              |            +--[return]---> response dict
-              |
-              +--[execute]--> scenarios.execute_tool(name, args, call_id, dump_cfg)
-                              |
-                              +--[observe_screen]--> winapi.capture_screenshot_png()
-                              |                      |
-                              |                      +--[save]-> disk (dumps/*.png)
-                              |                      |
-                              |                      +--[return]-> PNG bytes + dimensions
-                              |
-                              +--[click_element]---> utils.parse_box()
-                              |                      winapi.norm_to_screen_px()
-                              |                      winapi.move_mouse_to_pixel()
-                              |                      winapi.click_mouse()
-                              |
-                              +--[type_text]-------> winapi.type_text()
-                              |
-                              +--[press_key]-------> winapi.press_key()
-                              |
-                              +--[scroll]----------> winapi.scroll_down()
-              |
-              +--[prune]----> utils.prune_old_screenshots()
-              |               utils.prune_old_thinks()
-              |
-              +--[return]---> final output string
-  |
-  +--[report]-> print log file location
+  +-> agent.py (run_agent loop)
+        |
+        +-> scenarios.py (tool execution & task definitions)
+        |     |
+        |     +-> winapi.py (Windows API bindings)
+        |
+        +-> utils.py (HTTP, parsing, logging, message hygiene)
 ```
+
+## COMPONENT ANALYSIS
+
+### main.py
+**Role:** Entry point and orchestrator.
+
+**Responsibilities:**
+- Parse command-line arguments (scenario selection)
+- Initialize DPI awareness via winapi
+- Load configuration from environment variables with defaults
+- Create dump directory for screenshots
+- Initialize HTTP exchange logger
+- Invoke agent loop with selected scenario
+- Handle top-level exceptions and logging
+
+**Key Configuration:**
+- LM Studio endpoint: `LMSTUDIO_ENDPOINT` (default: localhost:1234)
+- Model: `LMSTUDIO_MODEL` (default: qwen3-vl-8b-instruct)
+- Timeout: `LMSTUDIO_TIMEOUT` (default: 240s)
+- Temperature: `LMSTUDIO_TEMPERATURE` (default: 0.6)
+- Max tokens: `LMSTUDIO_MAX_TOKENS` (default: 2048)
+- Image dimensions: `AGENT_IMAGE_W/H` (default: 1536x864)
+- Screenshot retention: `AGENT_KEEP_LAST_SCREENSHOTS` (default: 2)
+- Think tag retention: `AGENT_KEEP_LAST_THINKS` (default: 2)
+- Max steps per task: `AGENT_MAX_STEPS` (default: 10)
+- Step delay: `AGENT_STEP_DELAY` (default: 0.4s)
+
+**Dependencies:** scenarios, utils, winapi, agent
+
+---
+
+### agent.py
+**Role:** Core agent execution loop implementing perceive-think-act cycle.
+
+**Algorithm:**
+1. Initialize conversation with system prompt and task prompt
+2. Capture initial screenshot via `observe_screen` tool
+3. Enter loop (max_steps iterations):
+   - Send messages + tools schema to LLM endpoint
+   - Receive assistant message (with optional tool calls)
+   - Prune old think tags from conversation history
+   - If no tool calls: return final response
+   - Enforce single tool call per step (reject extras)
+   - Execute tool via scenarios.execute_tool()
+   - Append tool response and optional user message (screenshots)
+   - Prune old screenshots from conversation history
+   - Sleep (step_delay)
+4. Return stripped response (without think tags)
+
+**Key Features:**
+- Tool call rate limiting (1 per step prevents model spam)
+- Conversation memory management (screenshot + think tag pruning)
+- Separation of tool response (role=tool) and observation data (role=user with image)
+
+**Dependencies:** scenarios, utils, time, json
+
+---
+
+### scenarios.py
+**Role:** Tool execution engine and task definition repository.
+
+**Tool Catalog:**
+1. **observe_screen** - Capture screenshot, return as base64 PNG in user message
+2. **click_element** - Click UI element using normalized coordinates (0-1000)
+3. **type_text** - Type ASCII text into focused input field
+4. **press_key** - Press keyboard key or combination (enter, tab, ctrl+c, etc.)
+5. **scroll_at_position** - Scroll down at specified position
+
+**Coordinate System:**
+- Normalized 0-1000 range (x: 0=left, 1000=right; y: 0=top, 1000=bottom)
+- Three accepted box formats:
+  - Point: `[x, y]` (preferred for small targets)
+  - Flat bbox: `[x1, y1, x2, y2]`
+  - Legacy bbox: `[[x1, y1], [x2, y2]]`
+
+**Tool Execution Flow:**
+- Parse tool arguments (JSON string or dict)
+- Validate inputs (label, box, text, key)
+- Convert normalized coordinates to screen pixels via winapi
+- Execute Windows API calls (mouse move, click, keyboard input)
+- Add delays for UI responsiveness (80-120ms)
+- Return JSON response: `{ok: true, ...}` or `{ok: false, error: {...}}`
+
+**State Management:**
+- Global `_screen_dimensions` dict tracks actual screen resolution
+- Updated on each `observe_screen` call
+- Used for coordinate translation in all action tools
+
+**System Prompt:**
+Defines agent capabilities, coordinate system, operating protocol (observe -> think -> act -> verify), and rules (one action per step, always verify actions).
+
+**Scenarios:**
+Predefined tasks with name and task_prompt. Current scenarios:
+1. Grok AI conversation (never-ending investigation loop)
+2. Open Windows Start Menu (with verification)
+3. Open Start Menu + Notepad++ + document actions
+
+**Dependencies:** utils, winapi, base64, os, time
+
+---
+
+### winapi.py
+**Role:** Low-level Windows API bindings for screen capture and input simulation.
+
+**API Coverage:**
+
+**Display Management:**
+- `init_dpi()` - Set DPI awareness context (per-monitor v2)
+- `get_screen_size()` - Query primary monitor dimensions
+- `norm_to_screen_px(xn, yn, w, h)` - Convert 0-1000 coords to pixels
+
+**Screen Capture:**
+- `capture_screenshot_png(target_w, target_h)` - Capture, scale, encode PNG
+  - Uses GDI32 CreateDIBSection for direct pixel buffer access
+  - StretchBlt with HALFTONE mode for high-quality scaling
+  - Draws cursor overlay with hotspot alignment
+  - BGRA to RGB conversion
+  - Manual PNG encoding (IHDR + IDAT + IEND chunks, zlib compression)
+  - Returns: (png_bytes, screen_w, screen_h)
+
+**Mouse Control:**
+- `move_mouse_to_pixel(x, y)` - Set cursor position
+- `click_mouse()` - Left button down + up via SendInput
+- `scroll_down(amount)` - Mouse wheel event (default 120 units)
+
+**Keyboard Control:**
+- `type_text(text)` - Unicode keyboard input via KEYEVENTF_UNICODE
+- `press_key(key)` - Virtual key codes for special keys and combinations
+  - Supported: enter, tab, escape, windows, ctrl, alt, shift, F4, letters
+  - Combination format: "ctrl+c", "alt+f4", etc.
+
+**Implementation Details:**
+- ctypes-based bindings (user32.dll, gdi32.dll)
+- Defensive wintypes attribute handling for incomplete Python builds
+- Structure definitions: POINT, CURSORINFO, ICONINFO, BITMAPINFOHEADER, INPUT unions
+- Error handling via return code checks and RuntimeError exceptions
+
+**Dependencies:** ctypes, struct, time, zlib
+
+---
+
+### utils.py
+**Role:** Shared utilities for HTTP communication, parsing, logging, and message hygiene.
+
+**HTTP Logging:**
+- `init_http_logger(log_file)` - Create dedicated logger for request/response pairs
+- `post_json(payload, endpoint, timeout)` - POST JSON with logging
+  - Logs sanitized request (truncates base64 images, tools schema, prompts)
+  - Logs full response
+  - Returns parsed JSON response dict
+
+**JSON Helpers:**
+- `ok_payload(extra)` - Success response: `{ok: true, ...}`
+- `err_payload(error_type, message)` - Error response: `{ok: false, error: {...}}`
+- `parse_args(arg_str)` - Parse tool arguments (dict, JSON string, or None)
+
+**Box Parsing:**
+- `parse_box(box)` - Unified parser for three coordinate formats
+  - Point `[x, y]` -> `(x, y, x, y)` (zero-area bbox)
+  - Flat `[x1, y1, x2, y2]` -> `(x1, y1, x2, y2)`
+  - Legacy `[[x1, y1], [x2, y2]]` -> `(x1, y1, x2, y2)`
+  - Clamps to 0-1000 range, swaps inverted coordinates
+- `box_center(x1, y1, x2, y2)` - Compute center point
+
+**Message Hygiene:**
+- `strip_think(text)` - Remove `<think>...</think>` tags from final output
+- `prune_old_screenshots(messages, keep_last)` - Remove old image_url content, keep N recent
+- `prune_old_thinks(messages, keep_last)` - Strip think tags from old assistant messages
+- Prevents conversation context overflow and token budget exhaustion
+
+**Image Data Truncation (for logs):**
+- `summarize_data_image_url(url)` - Replace base64 payload with SHA256 hash + length
+- `truncate_base64_images(obj)` - Recursively sanitize data URLs in nested structures
+
+**Environment Helpers:**
+- `get_env_str(name, default)` - String variable with fallback
+- `get_env_int(name, default)` - Integer variable with fallback
+- `get_env_float(name, default)` - Float variable with fallback
+
+**Dependencies:** hashlib, json, logging, re, urllib.request, pathlib
 
 ---
 
 ## DATA FLOW
 
-### Logging Flow (New)
-1. main.py calls utils.init_http_logger(log_file) at startup
-2. Logger instance stored in utils._http_logger global
-3. Every utils.post_json() call automatically logs:
-   - Request: separator + "REQUEST TO MODEL:" + pretty JSON (with truncated images)
-   - Response: separator + "RESPONSE FROM MODEL:" + pretty JSON
-4. Log file written synchronously (no buffering issues)
-5. Log file complete even on crashes (Python logging auto-flushes)
+### Initialization Sequence
+```
+main.py
+  -> winapi.init_dpi()
+  -> utils.init_http_logger()
+  -> agent.run_agent()
+       -> scenarios.execute_tool("observe_screen")
+            -> winapi.capture_screenshot_png()
+            -> save to dumps/screen_NNNN.png
+            -> return (tool_msg, user_msg_with_image)
+```
 
-### Screenshot Capture Flow
-1. agent.py requests observe_screen
-2. scenarios.execute_tool("observe_screen") called
-3. winapi.capture_screenshot_png(target_w, target_h) captures screen
-4. PNG saved to dumps/screen_NNNN.png
-5. PNG encoded to base64
-6. scenarios.execute_tool returns:
-   - tool_message: {"ok": True, "file": path, "screen_width": w, "screen_height": h}
-   - user_message: {"role": "user", "content": [text, image_url]}
-7. agent.py appends both messages to history
-8. agent.py sends messages to LLM via utils.post_json()
-9. utils.post_json() logs request (with truncated image) before sending
-10. LLM receives screenshot in request
-11. LLM returns response
-12. utils.post_json() logs response after receiving
+### Agent Loop Iteration
+```
+agent.run_agent()
+  -> utils.post_json(messages + tools_schema)
+       -> HTTP POST to LM Studio endpoint
+       -> log request (sanitized) and response
+  -> receive assistant message (text + tool_calls)
+  -> utils.prune_old_thinks()
+  -> if tool_calls:
+       -> scenarios.execute_tool(name, args, call_id)
+            -> utils.parse_args()
+            -> if click_element:
+                 -> utils.parse_box()
+                 -> winapi.norm_to_screen_px()
+                 -> winapi.move_mouse_to_pixel()
+                 -> winapi.click_mouse()
+            -> if type_text:
+                 -> winapi.type_text()
+            -> if press_key:
+                 -> winapi.press_key()
+            -> if scroll_at_position:
+                 -> winapi.norm_to_screen_px()
+                 -> winapi.move_mouse_to_pixel()
+                 -> winapi.scroll_down()
+            -> if observe_screen:
+                 -> winapi.capture_screenshot_png()
+                 -> save PNG + return user_msg with base64
+       -> append tool response
+       -> utils.prune_old_screenshots()
+       -> sleep(step_delay)
+  -> else: return strip_think(last_content)
+```
 
-### Click Action Flow
-1. LLM returns tool_call: click_element(label="Button", box=[500, 300])
-2. utils.post_json() logs response containing tool_call
-3. agent.py extracts tool call, invokes scenarios.execute_tool("click_element")
-4. scenarios.execute_tool:
-   - Parses box via utils.parse_box() -> (x1, y1, x2, y2)
-   - Computes center via utils.box_center()
-   - Converts normalized coords to pixels via winapi.norm_to_screen_px()
-   - Moves mouse via winapi.move_mouse_to_pixel(px, py)
-   - Clicks via winapi.click_mouse()
-5. Returns tool_message: {"ok": True, "clicked": label, "click_position": [cx, cy]}
-6. agent.py appends tool_message to history
-7. Next utils.post_json() call logs request including tool_message
-
-### Message History Pruning
-1. agent.py maintains messages list
-2. After each tool execution:
-   - utils.prune_old_screenshots(messages, keep_last) removes old image_url data
-   - utils.prune_old_thinks(messages, keep_last) removes old <think> tags
-3. Only last N screenshots and think blocks retained in context
-4. Full data still logged before pruning (log contains complete history)
+### Coordinate Translation Pipeline
+```
+LLM outputs normalized coords [0-1000]
+  -> scenarios.execute_tool()
+       -> utils.parse_box() [validate + clamp]
+       -> utils.box_center() [compute center]
+       -> winapi.norm_to_screen_px(cx, cy, screen_w, screen_h)
+            -> x_pixel = (cx / 1000.0) * (screen_w - 1)
+            -> y_pixel = (cy / 1000.0) * (screen_h - 1)
+       -> winapi.move_mouse_to_pixel(x_pixel, y_pixel)
+            -> user32.SetCursorPos()
+```
 
 ---
 
-## COORDINATE SYSTEM
+## INTER-COMPONENT RELATIONSHIPS
 
-**Normalized Coordinates**: 0-1000 scale (device-independent)
-- X: 0 (left edge) to 1000 (right edge)
-- Y: 0 (top edge) to 1000 (bottom edge)
-- Center: (500, 500)
+### Dependency Graph
+```
+main.py
+  |-> agent.py
+  |     |-> scenarios.py
+  |     |     |-> utils.py (parse_args, parse_box, ok_payload, err_payload)
+  |     |     |-> winapi.py (all I/O functions)
+  |     |-> utils.py (post_json, prune_*, strip_think)
+  |-> utils.py (get_env_*, init_http_logger)
+  |-> winapi.py (init_dpi)
+  |-> scenarios.py (SYSTEM_PROMPT, TOOLS_SCHEMA, SCENARIOS)
+```
 
-**Conversion**: winapi.norm_to_screen_px(xn, yn, screen_w, screen_h)
-- Formula: pixel_x = round((xn / 1000.0) * (screen_w - 1))
-- Formula: pixel_y = round((yn / 1000.0) * (screen_h - 1))
-- Clamping: xn, yn constrained to [0, 1000]
+### Communication Patterns
 
-**Box Formats** (all valid):
-- Point click: [x, y] (preferred for small targets)
-- Flat bbox: [x1, y1, x2, y2]
-- Legacy bbox: [[x1, y1], [x2, y2]]
+**Agent <-> LLM:**
+- Protocol: OpenAI-compatible chat completions API
+- Request: `{model, messages, tools, tool_choice, temperature, max_tokens}`
+- Response: `{choices: [{message: {role, content, tool_calls}}]}`
+- Transport: HTTP POST via utils.post_json()
 
-**Normalization** (in utils.parse_box):
-- Ensures x1 <= x2, y1 <= y2
-- Clamps all coords to [0, 1000]
+**Agent <-> Scenarios:**
+- Interface: `execute_tool(name, arg_str, call_id, dump_cfg) -> (tool_msg, user_msg)`
+- tool_msg: JSON response from tool execution (role=tool)
+- user_msg: Optional multimodal message with screenshot (role=user)
+
+**Scenarios <-> WinAPI:**
+- Interface: Direct function calls (no error codes, raises RuntimeError on failure)
+- Input: Pixel coordinates, text strings, key names
+- Output: PNG bytes, screen dimensions, void
+
+**Utils <-> All Components:**
+- Shared utility layer (no state, pure functions)
+- Logging side effects isolated to _http_logger global
+
+---
+
+## TECHNICAL SPECIFICATIONS
+
+### Coordinate System
+- **Normalized Range:** 0-1000 (x and y axes)
+- **Rationale:** Resolution-independent, integer-friendly, intuitive scale
+- **Translation Formula:** `pixel = (normalized / 1000.0) * (dimension - 1)`
+- **Clamping:** All inputs clamped to [0, 1000] before translation
+
+### Screenshot Pipeline
+- **Capture Method:** GDI32 BitBlt (screen DC -> memory DC)
+- **Scaling:** StretchBlt with HALFTONE mode (high quality)
+- **Color Format:** BGRA32 (Windows native) -> RGB24 (PNG)
+- **Encoding:** Manual PNG construction (no PIL dependency)
+  - Chunk sequence: IHDR (image header) -> IDAT (compressed pixel data) -> IEND
+  - Compression: zlib level 6
+- **Cursor Overlay:** DrawIconEx with hotspot offset correction
+- **Default Resolution:** 1536x864 (target dimensions)
+
+### Input Simulation
+- **Method:** SendInput API (hardware-independent, respects UIPI)
+- **Mouse:** MOUSEINPUT structures with LEFTDOWN/LEFTUP/WHEEL flags
+- **Keyboard:** 
+  - Text: KEYEVENTF_UNICODE (UTF-16 code points)
+  - Keys: Virtual key codes (VK_*) with down/up events
+- **Timing:** 5ms delay between key events, 80-120ms after actions
+
+### Conversation Management
+- **Screenshot Retention:** Keep last N images, replace older with placeholder text
+- **Think Tag Retention:** Keep last N assistant messages with tags, strip from older
+- **Pruning Triggers:** After each tool response (screenshots), after each LLM response (thinks)
+- **Memory Optimization:** Prevents token budget overflow in long-running tasks
+
+### Error Handling
+- **Tool Errors:** JSON error payloads with type + message
+  - Types: missing_label, missing_box, invalid_box, invalid_args, invalid_json, empty_text, missing_key, invalid_key, unknown_tool, too_many_tool_calls
+- **WinAPI Errors:** RuntimeError exceptions with descriptive messages
+- **HTTP Errors:** Propagated urllib exceptions (timeout, connection errors)
+- **Agent Loop:** Max steps limit prevents infinite loops
+
+### Logging
+- **HTTP Exchange Log:** Timestamped file (agent_run_YYYYMMDD_HHMMSS.log)
+- **Log Contents:**
+  - Sanitized requests (tools/prompts truncated, images summarized)
+  - Full responses (including tool calls and content)
+  - Clean JSON formatting (no empty/brace-only lines)
+- **Screenshot Dump:** Sequential PNGs (screen_0001.png, screen_0002.png, ...)
 
 ---
 
 ## CONFIGURATION
 
-**Configuration Sources**:
-1. Environment variables (LMSTUDIO_*, AGENT_*)
-2. Command-line arguments (scenario number)
-3. Hardcoded defaults in main.py
+### Environment Variables
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| LMSTUDIO_ENDPOINT | str | http://localhost:1234/v1/chat/completions | LLM API endpoint |
+| LMSTUDIO_MODEL | str | qwen3-vl-8b-instruct | Model identifier |
+| LMSTUDIO_TIMEOUT | int | 240 | HTTP timeout (seconds) |
+| LMSTUDIO_TEMPERATURE | float | 0.6 | Sampling temperature |
+| LMSTUDIO_MAX_TOKENS | int | 2048 | Max completion tokens |
+| AGENT_IMAGE_W | int | 1536 | Screenshot width |
+| AGENT_IMAGE_H | int | 864 | Screenshot height |
+| AGENT_DUMP_DIR | str | dumps | Screenshot directory |
+| AGENT_DUMP_PREFIX | str | screen_ | Screenshot filename prefix |
+| AGENT_DUMP_START | int | 1 | Initial screenshot index |
+| AGENT_KEEP_LAST_SCREENSHOTS | int | 2 | Screenshot retention count |
+| AGENT_KEEP_LAST_THINKS | int | 2 | Think tag retention count |
+| AGENT_MAX_STEPS | int | 10 | Max agent loop iterations |
+| AGENT_STEP_DELAY | float | 0.4 | Delay between steps (seconds) |
 
-**Key Configuration Parameters**:
-- **endpoint**: LM Studio API URL
-- **model_id**: LLM model identifier
-- **timeout**: HTTP request timeout (seconds)
-- **temperature**: LLM sampling temperature
-- **max_tokens**: LLM response token limit
-- **target_w, target_h**: Screenshot dimensions (sent to LLM)
-- **keep_last_screenshots**: Context window screenshot retention
-- **keep_last_thinks**: Context window think tag retention
-- **max_steps**: Maximum agent loop iterations
-- **step_delay**: Delay between actions (seconds)
-
-**Dump Configuration**:
-- **dump_dir**: Screenshot save directory
-- **dump_prefix**: Screenshot filename prefix
-- **dump_start**: Initial screenshot index
-- **dump_idx**: Current screenshot index (incremented per capture)
-
----
-
-## ERROR HANDLING
-
-**Tool Execution Errors**:
-- Returned as {"ok": False, "error": {"type": str, "message": str}}
-- Error types: invalid_json, invalid_args, invalid_box, missing_label, missing_key, empty_text, invalid_key, unknown_tool, too_many_tool_calls
-
-**HTTP Errors**:
-- urllib.request.urlopen exceptions propagate to main.py
-- Caught in main.py try/except, prints log location and re-raises
-- Partial log available even on crashes
-
-**Logging Robustness**:
-- Python logging module handles file I/O errors gracefully
-- Auto-flushes after each log entry (no data loss)
-- Log file created immediately (visible even if process killed)
-
-**Signal Handling**:
-- Not implemented (removed for simplicity)
-- Ctrl+C causes immediate termination
-- Log file contains all data up to interruption point
-
-**Cleanup Guarantees**:
-- No explicit cleanup required
-- Log file auto-flushed by Python logging
-- Screenshots saved synchronously (no buffering)
+### Hardcoded Constants
+- DPI Awareness: PER_MONITOR_AWARE_V2
+- Mouse wheel scroll: 120 units (negative = down)
+- Key press delay: 5ms between down/up
+- Action delays: 60-120ms (tool-specific)
+- PNG compression: zlib level 6
+- Think tag regex: `<think>.*?</think>` (DOTALL mode)
 
 ---
 
-## LOGGING AND DEBUGGING
+## USAGE
 
-**HTTP Exchange Log**:
-- Format: agent_run_YYYYMMDD_HHMMSS.log
-- Location: Same directory as main.py
-- Created at startup (before first request)
-- Contains:
-  - All requests sent to LM Studio (pretty-printed JSON)
-  - All responses received from LM Studio (pretty-printed JSON)
-  - Base64 image data replaced with SHA256 hash summaries
-  - Separator lines (80 equals signs)
-  - Section headers (REQUEST TO MODEL, RESPONSE FROM MODEL)
-
-**Screenshot Dumps**:
-- Every observe_screen call saves PNG to dumps/screen_NNNN.png
-- Enables visual debugging of agent behavior
-- Incremental numbering (dump_idx)
-
-**Log Structure Example**:
+### Command Line
+```bash
+python main.py <scenario_num>
 ```
-================================================================================
-REQUEST TO MODEL:
-================================================================================
-{
-  "model": "qwen3-vl-4b-instruct",
-  "messages": [
-    {
-      "role": "system",
-      "content": "You are an autonomous AI agent..."
-    },
-    {
-      "role": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "Current screen state..."
-        },
-        {
-          "type": "image_url",
-          "image_url": {
-            "url": "data:image/png;base64,[b64 sha=a1b2c3d4e5f6 len=245678]"
-          }
-        }
-      ]
-    }
-  ],
-  "tools": [...],
-  "temperature": 0.4,
-  "max_tokens": 2048
-}
+- scenario_num: 1-based index into scenarios.SCENARIOS list
 
-================================================================================
-RESPONSE FROM MODEL:
-================================================================================
-{
-  "choices": [
-    {
-      "message": {
-        "role": "assistant",
-        "content": "<think>...</think>I see a button...",
-        "tool_calls": [
-          {
-            "id": "call_abc123",
-            "function": {
-              "name": "click_element",
-              "arguments": "{\"label\":\"Button\",\"box\":[500,300]}"
-            }
-          }
-        ]
-      }
-    }
-  ]
-}
-
+### Example Execution
+```bash
+python main.py 2
 ```
+Runs scenario 2: "Open start menu on Windows" (with verification loop)
 
-**Debugging Strategies**:
-
-**Visual Debugging**:
-- Inspect dumps/screen_*.png sequence
-- Verify agent sees correct UI state
-- Check cursor position in screenshots
-- Correlate screenshot numbers with log entries
-
-**Log Analysis**:
-- Review agent_run_*.log for request/response pairs
-- Verify tool call arguments (especially box coordinates)
-- Check error messages in tool responses
-- Trace message history evolution
-- Verify image data truncation working (no giant base64 blocks)
-
-**Configuration Tuning**:
-- Reduce max_steps for faster iteration
-- Increase step_delay if UI laggy
-- Adjust temperature for more/less randomness
-- Modify keep_last_screenshots to see more/less context
-
-**Coordinate Validation**:
-- Check click_element arguments in REQUEST sections
-- Verify box coordinates in 0-1000 range
-- Cross-reference with screenshots to validate positioning
-- Use point clicks [x, y] for better precision on small targets
+### Output Artifacts
+- **Console:** Final agent response (stripped of think tags)
+- **Log File:** agent_run_YYYYMMDD_HHMMSS.log (full HTTP exchange)
+- **Screenshots:** dumps/screen_NNNN.png (sequential captures)
 
 ---
 
-## EXTERNAL DEPENDENCIES
+## SYSTEM REQUIREMENTS
 
-**Python Standard Library**:
-- ctypes (Win32 API bindings)
-- json (JSON parsing/serialization)
-- logging (HTTP exchange logging)
-- time (delays)
-- zlib (PNG compression, CRC32)
-- struct (binary packing for PNG)
-- hashlib (SHA256 for image summaries)
-- urllib.request (HTTP client)
-- pathlib (file paths)
-- datetime (log file timestamps)
-- re (regex for think tag removal)
-- os (environment variables, filesystem)
-- sys (argv, exit, stderr)
+### Platform
+- Windows 11 Pro 25H2 (tested configuration)
+- Windows 10+ (likely compatible, untested)
 
-**External Services**:
-- LM Studio server (local HTTP API, OpenAI-compatible)
+### Python
+- Version: 3.12.10 (tested)
+- Standard library only (no external packages)
 
-**Operating System**:
-- Windows (user32.dll, gdi32.dll)
+### LLM Backend
+- LM Studio 0.3.37 (Build 1) or compatible OpenAI API server
+- Model: Qwen3-VL series (multimodal vision-language model)
+  - Tested: qwen3-vl-4b-instruct, qwen3-vl-8b-instruct
+  - Note: Qwen2.5-VL and Qwen2-VL are incompatible (different architectures)
 
-**No Third-Party Python Packages Required** (PIL-free PNG encoding)
+### Hardware
+- Display: 1080p (1920x1080) with 125% Windows scaling (tested)
+- Arbitrary resolutions supported (normalized coordinates)
 
 ---
 
-## LIMITATIONS AND CONSTRAINTS
+## LIMITATIONS
 
-**Platform**: Windows only (Win32 API)
+### Tool Constraints
+- **type_text:** ASCII only (non-ASCII stripped)
+- **press_key:** Limited key vocabulary (see _VK dict in winapi.py)
+- **click_element:** Single display only (primary monitor)
+- **observe_screen:** Cursor overlay may obscure small UI elements
 
-**Keyboard Input**:
-- type_text: ASCII only (non-ASCII stripped)
-- press_key: Limited key vocabulary (_VK dictionary)
-- Cannot press key combinations beyond predefined set
+### Agent Constraints
+- Single tool call per step (enforced, excess calls rejected)
+- No parallel action execution
+- No rollback/undo mechanism
+- Max steps limit (configurable, default 10)
 
-**Screenshot**:
-- Fixed target resolution (configurable)
-- Always captures entire screen (no window isolation)
-- Cursor overlay may not work for all cursor types
+### Vision Constraints
+- Screenshot resolution fixed (default 1536x864)
+- No OCR (relies on LLM vision capabilities)
+- No element detection (LLM must infer coordinates from pixels)
 
-**Coordinate Precision**:
-- Normalized 0-1000 scale limits subpixel precision
-- Suitable for typical UI elements (buttons, icons)
-
-**LLM Constraints**:
-- Requires vision-language model (VLM)
-- Context window limited (screenshot pruning required)
-- One tool call enforced per step (prevents spam)
-
-**Logging Constraints**:
-- Log file size grows linearly with number of requests
-- Image truncation helps but log can still be large for long runs
-- No log rotation or compression
-
-**Interrupt Handling**:
-- Ctrl+C causes immediate termination (no graceful shutdown)
-- Log file contains data up to interruption (may be mid-request)
+### API Constraints
+- OpenAI-compatible format required (tools field, tool_calls response)
+- No streaming support
+- Synchronous HTTP only
 
 ---
 
 ## SECURITY CONSIDERATIONS
 
-**Unrestricted System Access**:
-- Agent can click anywhere, type anything, press any key
-- No sandboxing or access control
-- Intended for controlled environments only
+### Risks
+- **Unrestricted Desktop Access:** Agent can control mouse/keyboard, execute any GUI action
+- **No Sandboxing:** Direct Windows API calls, no isolation
+- **Arbitrary Tool Execution:** LLM determines all actions (potential for unintended behavior)
+- **Screenshot Leakage:** Captures all visible content (passwords, sensitive data)
 
-**Credential Exposure**:
-- Typed passwords visible in screenshots
-- Screenshots sent to LLM endpoint (base64 in requests)
-- Full request/response history logged to disk (including screenshots as base64 hashes)
-- Log file does not redact sensitive text content
-
-**Network**:
-- Sends screenshots to LLM endpoint (local by default)
-- If endpoint is remote, screenshots transmitted over network
-- No encryption beyond what endpoint provides (https)
-
-**File System**:
-- Writes screenshots to disk (dumps directory)
-- Writes HTTP logs to script directory
-- No path sanitization for dump_dir or log file location
-- Log files contain base64 image hashes (not full data, but summary)
+### Mitigations
+- Run in controlled environment (VM, dedicated machine)
+- Review scenario task_prompts before execution
+- Monitor log files for unexpected tool calls
+- Use max_steps limit to prevent runaway loops
+- No network tool access (current tool set is local only)
 
 ---
 
 ## EXTENSION POINTS
 
-**Adding New Tools**:
-1. Add tool schema to scenarios.TOOLS_SCHEMA
-2. Add tool handler to scenarios.execute_tool()
-3. Implement action via winapi functions or new winapi bindings
-4. Tool calls automatically logged via utils.post_json()
+### Adding New Tools
+1. Define tool schema in scenarios.TOOLS_SCHEMA
+2. Add execution logic in scenarios.execute_tool()
+3. Implement primitive operations in winapi.py (if needed)
+4. Update SYSTEM_PROMPT with tool documentation
 
-**Adding New Scenarios**:
-1. Append to scenarios.SCENARIOS list
-2. Provide task_prompt string
+### Custom Scenarios
+1. Append dict to scenarios.SCENARIOS list: `{name, task_prompt}`
+2. Run via `python main.py <new_index>`
 
-**Supporting Non-Windows Platforms**:
-1. Implement platform-specific bindings in separate module (e.g., x11api.py, macapi.py)
-2. Abstract platform detection in main.py
-3. Use platform-specific screenshot/input modules
+### Alternative LLM Backends
+- Replace utils.post_json() with custom HTTP client
+- Ensure response format matches OpenAI structure
+- Verify tool calling support (function definitions + tool_calls response)
 
-**Custom LLM Backends**:
-1. Replace utils.post_json() with custom client
-2. Ensure response format matches OpenAI schema (choices, message, tool_calls)
-3. Update logging calls if custom client used
-
-**Enhanced Logging**:
-1. Add additional loggers for different components
-2. Implement log rotation via logging.handlers.RotatingFileHandler
-3. Add structured logging (JSON format) for machine parsing
-4. Filter sensitive data before logging
-
-**Error Recovery**:
-1. Catch specific exceptions in scenarios.execute_tool()
-2. Return structured error payloads
-3. Agent can retry or adjust strategy based on error type
-4. Add retry logic in agent.py for transient HTTP failures
+### Multi-Monitor Support
+- Extend winapi.get_screen_size() to enumerate displays
+- Add monitor selection parameter to capture/click functions
+- Update coordinate translation to account for display offsets
 
 ---
 
-## OPERATIONAL WORKFLOW
+## DEBUGGING
 
-**Startup**:
-1. User runs: python main.py <scenario_num>
-2. main.py loads configuration from environment
-3. winapi.init_dpi() sets DPI awareness
-4. Log file created: agent_run_YYYYMMDD_HHMMSS.log
-5. utils.init_http_logger() initializes Python logging
-6. Scenario task_prompt loaded from scenarios.SCENARIOS
-7. agent.run_agent() invoked with system prompt, task prompt, tools schema
+### HTTP Exchange
+- Check `agent_run_*.log` for full request/response pairs
+- Verify tool schema transmission (truncated in log, full in actual request)
+- Inspect assistant tool_calls format and arguments
 
-**Agent Loop**:
-1. observe_screen captures initial screenshot
-2. LLM receives system prompt + task prompt + screenshot (via utils.post_json)
-3. Request logged before sending
-4. Response logged after receiving
-5. LLM responds with tool call (e.g., click_element)
-6. Tool executed via scenarios.execute_tool()
-7. observe_screen captures result screenshot
-8. LLM receives updated screenshot (via utils.post_json)
-9. Request/response logged again
-10. Loop continues until task complete or max_steps reached
+### Screenshot Validation
+- Review `dumps/screen_*.png` files for actual captured content
+- Verify cursor position in overlay
+- Check scaling quality (HALFTONE mode)
 
-**Shutdown**:
-1. Agent returns final output string
-2. main.py prints output
-3. main.py prints log file location
-4. Process exits
+### Coordinate Issues
+- Print normalized coordinates before translation (add logging in scenarios.py)
+- Verify screen dimensions reported by observe_screen
+- Test with known UI element positions (e.g., Start button at ~10-20, 1000)
 
-**Interrupt Handling**:
-1. User presses Ctrl+C
-2. Process terminates immediately
-3. Log file contains all data written before interruption
-4. No cleanup required (Python logging auto-flushes)
+### Tool Execution Failures
+- Check tool response content field for error payloads
+- Verify Windows API return codes (RuntimeError exceptions)
+- Ensure focused window for type_text (click input field first)
 
 ---
 
-## PERFORMANCE CHARACTERISTICS
+## ARCHITECTURE NOTES
 
-**Screenshot Capture**: ~50-100ms (depends on resolution, scaling)
+### Design Decisions
+- **Normalized Coordinates:** Resolution-independent targeting (single prompt works across displays)
+- **Tool Call Limiting:** Prevents model from spamming multiple actions (common failure mode)
+- **Screenshot Pruning:** Token budget management for long tasks (keeps context window finite)
+- **Manual PNG Encoding:** Avoids PIL/Pillow dependency (pure ctypes + stdlib)
+- **Separate Tool/User Messages:** Tool responses are JSON metadata, observations are multimodal content
 
-**PNG Encoding**: ~100-200ms (pure Python, no PIL)
+### Trade-offs
+- **Performance vs Quality:** HALFTONE scaling (slower) for better image quality
+- **Flexibility vs Safety:** Full desktop access (powerful) with no sandboxing (dangerous)
+- **Memory vs History:** Aggressive pruning (small context) limits long-term memory
 
-**HTTP Latency**: Variable (depends on LLM inference time, typically 1-10s)
-
-**Step Delay**: Configurable (default 0.4s between actions)
-
-**Logging Overhead**: ~10-20ms per request/response (JSON serialization + file write)
-
-**Memory Usage**:
-- Message history grows linearly with steps
-- Pruning limits screenshot retention (default 2)
-- Peak memory ~100MB for typical runs
-- Log file grows on disk (not in memory)
-
-**Token Usage**:
-- Each screenshot ~1000-2000 vision tokens (model-dependent)
-- Context window exhaustion possible on long runs
-- Pruning mitigates but does not eliminate
-
-**Disk Usage**:
-- Screenshots: ~100-500KB per image (depends on complexity)
-- Log file: ~10-50KB per request/response (with truncated images)
-- Long runs can generate 100MB+ of data
+### Future Improvements
+- Element detection model (output bounding boxes, reduce coordinate inference burden)
+- Action replay/undo stack
+- Multi-monitor support
+- Streaming HTTP for faster response times
+- Persistent memory across runs (vector DB for task history)
 
 ---
 
-## SYSTEM ASSUMPTIONS
-
-**LM Studio**:
-- Running locally on http://localhost:1234
-- Model loaded (e.g., qwen3-vl-4b-instruct)
-- Supports OpenAI-compatible /v1/chat/completions API
-- Supports vision input (image_url)
-- Supports function calling (tools, tool_choice)
-
-**Windows Environment**:
-- Single monitor (multi-monitor untested)
-- Standard DPI scaling
-- English keyboard layout (key names hardcoded)
-
-**UI Assumptions**:
-- UI elements have stable positions between screenshots
-- Click actions complete within 0.12s
-- Typed text appears in focused field
-- Scroll actions move content predictably
-
-**File System**:
-- Write permissions in script directory (for logs)
-- Write permissions in dump_dir (for screenshots)
-
----
-
-## KNOWN ISSUES
-
-**Multi-Tool Calls**:
-- Agent enforces single tool per step
-- Extra tool calls rejected with too_many_tool_calls error
-- Prevents model from spamming actions
-
-**Context Window Exhaustion**:
-- Long runs may exceed LLM context limit
-- Pruning helps but not guaranteed solution
-- Agent may lose track of earlier state
-
-**Keyboard Input Limitations**:
-- No Unicode support (ASCII only)
-- Limited special key support
-- Cannot type Enter directly (must use press_key("enter"))
-
-**Screenshot Timing**:
-- Animations may cause inconsistent captures
-- Step delay mitigates but not eliminated
-- UI state may change between capture and action
-
-**Logging File Size**:
-- Log files grow without limit
-- Long runs (200 steps) can produce 5-10MB logs
-- No automatic compression or rotation
-
-**Interrupt Behavior**:
-- Ctrl+C causes immediate termination
-- No graceful shutdown
-- May leave partial data in log (last request incomplete)
-
----
-
-## SYSTEM INVARIANTS
-
-1. **Coordinate Range**: All normalized coordinates in [0, 1000]
-2. **Single Tool Per Step**: Agent executes at most 1 tool per iteration
-3. **Screenshot Before Action**: Initial observe_screen always called
-4. **Message Role Sequence**: system -> user -> assistant -> tool -> user -> assistant...
-5. **PNG Format**: All screenshots saved as PNG (never JPEG or other)
-6. **ASCII Typing**: type_text only sends ASCII characters
-7. **Logging Order**: Request logged before HTTP send, response logged after HTTP receive
-8. **Image Truncation**: Base64 images always truncated in logs (never full data written)
-9. **Log File Creation**: Log file created before first agent action
-10. **Synchronous Logging**: All log writes are synchronous (no buffering delay)
-
----
-
-## ARCHITECTURAL IMPROVEMENTS (vs. Previous Version)
-
-**Removed Complexity**:
-1. No LM Studio log parsing (8 functions removed, ~150 lines)
-2. No signal handling (SIGINT/SIGTERM handlers removed)
-3. No log export coordination (no cleanup functions)
-4. No timestamp-based filtering
-5. No log path detection logic
-6. No execution state tracking
-
-**Added Simplicity**:
-1. Direct HTTP logging at source (utils.post_json)
-2. Python logging module (standard library, robust)
-3. Timestamped log filenames (no overwrites)
-4. Automatic log flushing (crash-safe)
-5. Immediate log availability (no post-processing)
-
-**Net Code Change**:
-- Lines removed: ~200
-- Lines added: ~30
-- Complexity reduction: ~85%
-
-**Reliability Improvements**:
-1. No dependency on external log format
-2. No log extraction can fail
-3. Log complete even on crashes
-4. No signal handling edge cases
-5. Simpler error handling
-
-**Debugging Improvements**:
-1. Real-time log access (no waiting for shutdown)
-2. Complete request/response history
-3. Image data summarized (readable logs)
-4. Clear separation between requests and responses
-5. No parsing required (direct JSON)
-
----
-
-## FUTURE ENHANCEMENT OPPORTUNITIES
-
-**Logging Enhancements**:
-- Add log rotation via RotatingFileHandler (limit file size)
-- Add compression for old logs
-- Add structured logging (JSON lines format)
-- Add log levels (DEBUG, INFO, ERROR)
-- Add performance metrics (request duration, token counts)
-
-**Error Handling**:
-- Add retry logic for transient HTTP failures
-- Add exponential backoff
-- Add circuit breaker pattern
-- Add error recovery strategies in agent
-
-**Tool Enhancements**:
-- Add double-click support
-- Add right-click support
-- Add drag-and-drop
-- Add text selection
-- Add clipboard operations
-- Add window management (minimize, maximize, close)
-
-**Coordinate System**:
-- Add subpixel precision option
-- Add relative coordinates (from last click)
-- Add named anchor points (screen corners, center)
-
-**Platform Support**:
-- Add Linux support (X11 or Wayland)
-- Add macOS support (Quartz)
-- Add cross-platform abstraction layer
-
-**LLM Backend**:
-- Add support for multiple endpoints (fallback)
-- Add streaming response support
-- Add token counting and budgeting
-- Add response caching
-
-**Security**:
-- Add screenshot redaction (OCR + masking)
-- Add sensitive data filtering in logs
-- Add sandboxing via subprocess isolation
-- Add permission system for tools
-
----
-
-END OF TECHNICAL ANALYSIS
+END OF TECHNICAL ANALYSIS REPORT
