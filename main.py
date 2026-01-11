@@ -1,5 +1,15 @@
 # FILE: main.py
 
+
+"""
+LAPTOP HARDWARE and SOFTWARE details:
+- Windows 11 Pro 25H2
+- Python 3.12.10
+- Qwen3-VL (qwen3-vl-4b-instruct) NOTE: during internet sources search do not made a mistake where you may see model in version 2.5 or version 2 code examples thinking that they will be usefull, they will not, because te qwen3-VL is a modern model with modern architecture) Qwen3-VL is the multimodal large language model series developed by Qwen team, Alibaba Cloud. Official repository "cookbooks" (tutorials) https://github.com/QwenLM/Qwen3-VL/tree/main/cookbooks
+- LM Studio 0.3.37 (Build 1)
+- Laptop with a single display resolution of 1080p and Windows Scaling set to 125%
+"""
+
 from __future__ import annotations
 
 import os
@@ -31,9 +41,9 @@ def main() -> None:
 
     cfg = {
         "endpoint": utils.get_env_str("LMSTUDIO_ENDPOINT", "http://localhost:1234/v1/chat/completions"),
-        "model_id": utils.get_env_str("LMSTUDIO_MODEL", "qwen3-vl-4b-instruct"),
+        "model_id": utils.get_env_str("LMSTUDIO_MODEL", "qwen3-vl-8b-instruct"),
         "timeout": utils.get_env_int("LMSTUDIO_TIMEOUT", 240),
-        "temperature": utils.get_env_float("LMSTUDIO_TEMPERATURE", 0.4),
+        "temperature": utils.get_env_float("LMSTUDIO_TEMPERATURE", 0.6),
         "max_tokens": utils.get_env_int("LMSTUDIO_MAX_TOKENS", 2048),
         "target_w": utils.get_env_int("AGENT_IMAGE_W", 1536),
         "target_h": utils.get_env_int("AGENT_IMAGE_H", 864),
@@ -42,7 +52,7 @@ def main() -> None:
         "dump_start": utils.get_env_int("AGENT_DUMP_START", 1),
         "keep_last_screenshots": utils.get_env_int("AGENT_KEEP_LAST_SCREENSHOTS", 2),
         "keep_last_thinks": utils.get_env_int("AGENT_KEEP_LAST_THINKS", 2),
-        "max_steps": utils.get_env_int("AGENT_MAX_STEPS", 200),
+        "max_steps": utils.get_env_int("AGENT_MAX_STEPS", 10),
         "step_delay": utils.get_env_float("AGENT_STEP_DELAY", 0.4),
     }
 
