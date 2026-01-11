@@ -247,10 +247,31 @@ def post_json(payload: Dict[str, Any], endpoint: str, timeout: int) -> Dict[str,
         _http_logger.info("=" * 80)
         _http_logger.info("REQUEST TO MODEL:")
         _http_logger.info("=" * 80)
-        # Deep copy and truncate images for logging
         logged_payload = truncate_base64_images(json.loads(json.dumps(payload)))
-        _http_logger.info(json.dumps(logged_payload, indent=2, ensure_ascii=True))
-        _http_logger.info("")
+
+        logged_payload["tools"] = "[TOOLS DEFINITIONS TRUNCATED FOR LOG READABILITY]"
+        logged_payload["messages"][0]["content"] = "[SYSTEM PROMPT TRUNCATED FOR LOG READABILITY]"
+        logged_payload["messages"][1]["content"] = "[INITIAL USER TASK PROMPT TRUNCATED FOR LOG READABILITY]"
+
+
+        # # Compact & clean JSON dump (pretty base + remove useless brace/empty lines)
+        json_str = json.dumps(logged_payload, indent=2, ensure_ascii=True)
+        # clean_json = '\n'.join(
+        #     line for line in json_str.splitlines()
+        #     if line.rstrip() and not re.match(r'^\s*[\{\}\[\]],?\s*$', line.rstrip())
+        # )
+
+        # Two-pass cleanup (concise one-liner with multiple conditions)
+        clean_json = '\n'.join(
+            line for line in json_str.splitlines()
+            if line.rstrip()  # skip empty/whitespace-only lines
+            and not re.match(r'^\s*[{\}\[\]],?\s*$', line.rstrip())  # skip brace/bracket + optional comma lines
+            and not re.match(r'^\s*,\s*$', line.rstrip())             # skip pure comma lines (if any)
+        )
+
+
+        _http_logger.info(clean_json)
+        _http_logger.info("")  # blank line separator
     
     data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
     req = urllib.request.Request(
